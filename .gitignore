@@ -22,6 +22,7 @@ eggs/
 .eggs/
 *.egg
 *.sh
+!scripts/start_into_docker.sh
 
 .mcp.json
 .claude
