@@ -14,6 +14,7 @@ dependencies = [
     "omegaconf>=2.3",
     "plyfile>=1.0",
     "numpy>=1.26,<3",
+    "tensorboard>=2.16",
     "simple-knn",
     "pointops2",
     # diff-gaussian-rasterization is NOT a pip dep: gaussian_renderer/diff_gaussian_rasterization.py

@@ -13,7 +13,7 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrixCenterShift
-from kornia import create_meshgrid
+from kornia.geometry import create_meshgrid  # moved out of top-level in kornia 0.8.3
 from copy import deepcopy
 
 class Camera:
