@@ -22,3 +22,7 @@ eggs/
 .eggs/
 *.egg
 *.sh
+
+.mcp.json
+.claude
+.venv
