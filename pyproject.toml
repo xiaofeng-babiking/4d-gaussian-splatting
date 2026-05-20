@@ -1,0 +1,57 @@
+[project]
+name = "fourd-gaussian-splatting"
+version = "0.1.0"
+description = "Real-time Photorealistic Dynamic Scene Representation and Rendering with 4D Gaussian Splatting"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "torch>=2.6",
+    "torchvision>=0.21",
+    "tqdm>=4.67",
+    "torchmetrics>=1.4,<2",
+    "imagesize>=1.4",
+    "kornia>=0.7,<0.9",
+    "omegaconf>=2.3",
+    "plyfile>=1.0",
+    "numpy>=1.26,<3",
+    "simple-knn",
+    "pointops2",
+    "diff-gaussian-rasterization",
+]
+
+[tool.uv]
+package = false
+no-build-isolation-package = [
+    "simple-knn",
+    "pointops2",
+    "diff-gaussian-rasterization",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+simple-knn = { path = "./simple-knn" }
+pointops2 = { path = "./pointops2" }
+diff-gaussian-rasterization = { path = "./diff-gaussian-rasterization" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# Declare metadata for the local CUDA extensions so uv does not need to
+# import their setup.py (which itself imports torch) during resolution.
+[[tool.uv.dependency-metadata]]
+name = "simple-knn"
+version = "0.0.0"
+requires-dist = ["torch"]
+
+[[tool.uv.dependency-metadata]]
+name = "pointops2"
+version = "1.0"
+requires-dist = ["torch", "numpy"]
+
+[[tool.uv.dependency-metadata]]
+name = "diff-gaussian-rasterization"
+version = "0.0.0"
+requires-dist = ["torch"]

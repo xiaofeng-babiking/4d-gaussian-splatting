@@ -24,13 +24,26 @@
 
 ### Environment
 
-The hardware and software requirements are the same as those of the [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), which this code is built upon. To setup the environment, please run the following command:
+The hardware and software requirements are the same as those of the [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), which this code is built upon. Python dependencies are managed by [`uv`](https://docs.astral.sh/uv/); the project targets Python 3.12 and PyTorch built for CUDA 12.8.
+
+Requirements:
+
+- CUDA 12.8 toolkit + matching NVIDIA driver
+- `uv` installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 
 ```shell
 git clone https://github.com/fudan-zvg/4d-gaussian-splatting
 cd 4d-gaussian-splatting
-conda env create --file environment.yml
-conda activate 4dgs
+uv sync                                # installs Python 3.12, torch/cu128, and builds the CUDA extensions
+source .venv/bin/activate
+```
+
+#### Targeting a specific GPU architecture
+
+The CUDA extensions are compiled for a broad arch list by default (`7.0 7.5 8.0 8.6 8.9 9.0+PTX`). Override at build time when you only care about one GPU:
+
+```shell
+TORCH_CUDA_ARCH_LIST="8.6" uv sync --reinstall-package simple-knn --reinstall-package pointops2 --reinstall-package diff-gaussian-rasterization
 ```
 
 ### Data preparation
