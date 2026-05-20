@@ -1,125 +1,189 @@
-import os
 import argparse
 import glob
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import sys
 
 import numpy as np
-import json
-import sys
-import math
-import shutil
-import sqlite3
 
-IS_PYTHON3 = sys.version_info[0] >= 3
+# Schema below was lifted verbatim from COLMAP at commit afe04f56 (v3.14.0.dev0):
+#   src/colmap/scene/database_sqlite.cc :: Create*Table()
+# The rigs / rig_sensors / frames / frame_data / pose_priors tables were added in
+# the 3.10 rig-refactor; before that, pose priors lived inline on the images table
+# (columns prior_qw, prior_qx, ..., prior_tz). MIN_COLMAP_VERSION below gates that.
+MIN_COLMAP_VERSION = (3, 10)
 MAX_IMAGE_ID = 2**31 - 1
 
-CREATE_CAMERAS_TABLE = """CREATE TABLE IF NOT EXISTS cameras (
-    camera_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    model INTEGER NOT NULL,
-    width INTEGER NOT NULL,
-    height INTEGER NOT NULL,
-    params BLOB,
-    prior_focal_length INTEGER NOT NULL)"""
+COLMAP_SCHEMA = {
+    "rigs": (
+        "CREATE TABLE IF NOT EXISTS rigs ("
+        " rig_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+        " ref_sensor_id INTEGER NOT NULL,"
+        " ref_sensor_type INTEGER NOT NULL)"
+    ),
+    "rig_sensors": (
+        "CREATE TABLE IF NOT EXISTS rig_sensors ("
+        " rig_id INTEGER NOT NULL,"
+        " sensor_id INTEGER NOT NULL,"
+        " sensor_type INTEGER NOT NULL,"
+        " sensor_from_rig BLOB,"
+        " FOREIGN KEY(rig_id) REFERENCES rigs(rig_id) ON DELETE CASCADE)"
+    ),
+    "cameras": (
+        "CREATE TABLE IF NOT EXISTS cameras ("
+        " camera_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+        " model INTEGER NOT NULL,"
+        " width INTEGER NOT NULL,"
+        " height INTEGER NOT NULL,"
+        " params BLOB,"
+        " prior_focal_length INTEGER NOT NULL)"
+    ),
+    "frames": (
+        "CREATE TABLE IF NOT EXISTS frames ("
+        " frame_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+        " rig_id INTEGER NOT NULL,"
+        " FOREIGN KEY(rig_id) REFERENCES rigs(rig_id) ON DELETE CASCADE)"
+    ),
+    "frame_data": (
+        "CREATE TABLE IF NOT EXISTS frame_data ("
+        " frame_id INTEGER NOT NULL,"
+        " data_id INTEGER NOT NULL,"
+        " sensor_id INTEGER NOT NULL,"
+        " sensor_type INTEGER NOT NULL,"
+        " FOREIGN KEY(frame_id) REFERENCES frames(frame_id) ON DELETE CASCADE)"
+    ),
+    "images": (
+        "CREATE TABLE IF NOT EXISTS images ("
+        " image_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+        " name TEXT NOT NULL UNIQUE,"
+        " camera_id INTEGER NOT NULL,"
+        f" CONSTRAINT image_id_check CHECK(image_id >= 0 and image_id < {MAX_IMAGE_ID}),"
+        " FOREIGN KEY(camera_id) REFERENCES cameras(camera_id))"
+    ),
+    "pose_priors": (
+        "CREATE TABLE IF NOT EXISTS pose_priors ("
+        " image_id INTEGER PRIMARY KEY NOT NULL,"
+        " position BLOB,"
+        " coordinate_system INTEGER NOT NULL,"
+        " position_covariance BLOB,"
+        " FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE)"
+    ),
+    "keypoints": (
+        "CREATE TABLE IF NOT EXISTS keypoints ("
+        " image_id INTEGER PRIMARY KEY NOT NULL,"
+        " rows INTEGER NOT NULL,"
+        " cols INTEGER NOT NULL,"
+        " data BLOB,"
+        " FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE)"
+    ),
+    "descriptors": (
+        "CREATE TABLE IF NOT EXISTS descriptors ("
+        " image_id INTEGER PRIMARY KEY NOT NULL,"
+        " rows INTEGER NOT NULL,"
+        " cols INTEGER NOT NULL,"
+        " data BLOB,"
+        " FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE)"
+    ),
+    "matches": (
+        "CREATE TABLE IF NOT EXISTS matches ("
+        " pair_id INTEGER PRIMARY KEY NOT NULL,"
+        " rows INTEGER NOT NULL,"
+        " cols INTEGER NOT NULL,"
+        " data BLOB)"
+    ),
+    "two_view_geometries": (
+        "CREATE TABLE IF NOT EXISTS two_view_geometries ("
+        " pair_id INTEGER PRIMARY KEY NOT NULL,"
+        " rows INTEGER NOT NULL,"
+        " cols INTEGER NOT NULL,"
+        " data BLOB,"
+        " config INTEGER NOT NULL,"
+        " F BLOB, E BLOB, H BLOB, qvec BLOB, tvec BLOB)"
+    ),
+}
 
-CREATE_DESCRIPTORS_TABLE = """CREATE TABLE IF NOT EXISTS descriptors (
-    image_id INTEGER PRIMARY KEY NOT NULL,
-    rows INTEGER NOT NULL,
-    cols INTEGER NOT NULL,
-    data BLOB,
-    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE)"""
+COLMAP_INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS rig_ref_sensor_assignment ON rigs(ref_sensor_id, ref_sensor_type)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS rig_sensor_assignment ON rig_sensors(sensor_id, sensor_type)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS frame_sensor_assignment ON frame_data(data_id, sensor_type)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name)",
+]
 
-CREATE_IMAGES_TABLE = """CREATE TABLE IF NOT EXISTS images (
-    image_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    name TEXT NOT NULL UNIQUE,
-    camera_id INTEGER NOT NULL,
-    prior_qw REAL,
-    prior_qx REAL,
-    prior_qy REAL,
-    prior_qz REAL,
-    prior_tx REAL,
-    prior_ty REAL,
-    prior_tz REAL,
-    CONSTRAINT image_id_check CHECK(image_id >= 0 and image_id < {}),
-    FOREIGN KEY(camera_id) REFERENCES cameras(camera_id))
-""".format(MAX_IMAGE_ID)
 
-CREATE_TWO_VIEW_GEOMETRIES_TABLE = """
-CREATE TABLE IF NOT EXISTS two_view_geometries (
-    pair_id INTEGER PRIMARY KEY NOT NULL,
-    rows INTEGER NOT NULL,
-    cols INTEGER NOT NULL,
-    data BLOB,
-    config INTEGER NOT NULL,
-    F BLOB,
-    E BLOB,
-    H BLOB,
-    qvec BLOB,
-    tvec BLOB)
-"""
+def _parse_version(v):
+    """Parse e.g. '3.14.0.dev0' -> (3, 14). Returns (0, 0) for None/unparseable."""
+    if not v:
+        return (0, 0)
+    m = re.match(r"(\d+)\.(\d+)", v)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
-CREATE_KEYPOINTS_TABLE = """CREATE TABLE IF NOT EXISTS keypoints (
-    image_id INTEGER PRIMARY KEY NOT NULL,
-    rows INTEGER NOT NULL,
-    cols INTEGER NOT NULL,
-    data BLOB,
-    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE)
-"""
 
-CREATE_MATCHES_TABLE = """CREATE TABLE IF NOT EXISTS matches (
-    pair_id INTEGER PRIMARY KEY NOT NULL,
-    rows INTEGER NOT NULL,
-    cols INTEGER NOT NULL,
-    data BLOB)"""
+def get_colmap_version():
+    """Return the COLMAP version string (e.g. "3.14.0.dev0"), or None if the binary
+    is not callable. Parses the header line that COLMAP prints to stdout/stderr:
+        COLMAP 3.14.0.dev0 -- Structure-from-Motion and Multi-View Stereo
+    """
+    try:
+        out = subprocess.run(
+            ["colmap", "--help"], capture_output=True, text=True, timeout=10
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    for line in (out.stdout + out.stderr).splitlines():
+        m = re.match(r"COLMAP (\S+)", line)
+        if m:
+            return m.group(1)
+    return None
 
-CREATE_NAME_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name)"
 
-CREATE_ALL = "; ".join(
-    [
-        CREATE_CAMERAS_TABLE,
-        CREATE_IMAGES_TABLE,
-        CREATE_KEYPOINTS_TABLE,
-        CREATE_DESCRIPTORS_TABLE,
-        CREATE_MATCHES_TABLE,
-        CREATE_TWO_VIEW_GEOMETRIES_TABLE,
-        CREATE_NAME_INDEX,
-    ]
-)
+def check_colmap_compat():
+    """Abort if COLMAP isn't callable; warn if it predates our embedded schema."""
+    version = get_colmap_version()
+    if version is None:
+        sys.exit("FATAL: `colmap` not on PATH. Install COLMAP or add it to PATH.")
+    if _parse_version(version) < MIN_COLMAP_VERSION:
+        print(
+            f"WARNING: COLMAP {version} predates the rigs/frames refactor "
+            f"(introduced in {MIN_COLMAP_VERSION[0]}.{MIN_COLMAP_VERSION[1]}). "
+            f"The embedded schema in COLMAP_SCHEMA reflects the post-3.10 layout; "
+            f"COLMAP itself still owns the live schema, so updates are safe."
+        )
+    return version
 
 
 def array_to_blob(array):
-    if IS_PYTHON3:
-        return array.tostring()
-    else:
-        return np.getbuffer(array)
+    # `ndarray.tostring()` was removed in NumPy 2.0; `tobytes()` is the modern equivalent.
+    return array.tobytes()
 
 
 def blob_to_array(blob, dtype, shape=(-1,)):
-    if IS_PYTHON3:
-        return np.fromstring(blob, dtype=dtype).reshape(*shape)
-    else:
-        return np.frombuffer(blob, dtype=dtype).reshape(*shape)
+    # `np.fromstring` was removed in NumPy 2.0; `np.frombuffer` is the modern equivalent.
+    return np.frombuffer(blob, dtype=dtype).reshape(*shape)
 
 
 class COLMAPDatabase(sqlite3.Connection):
+    """SQLite wrapper for COLMAP databases.
+
+    In this script's pipeline the schema is materialised by `colmap feature_extractor`,
+    so `update_camera` is the only path actually exercised. `create_tables` is provided
+    for callers that need a standalone DB; it mirrors the schema embedded above
+    (COLMAP_SCHEMA / COLMAP_INDEXES).
+    """
 
     @staticmethod
     def connect(database_path):
         return sqlite3.connect(database_path, factory=COLMAPDatabase)
 
-    def __init__(self, *args, **kwargs):
-        super(COLMAPDatabase, self).__init__(*args, **kwargs)
-
-        self.create_tables = lambda: self.executescript(CREATE_ALL)
-        self.create_cameras_table = lambda: self.executescript(CREATE_CAMERAS_TABLE)
-        self.create_descriptors_table = lambda: self.executescript(
-            CREATE_DESCRIPTORS_TABLE
-        )
-        self.create_images_table = lambda: self.executescript(CREATE_IMAGES_TABLE)
-        self.create_two_view_geometries_table = lambda: self.executescript(
-            CREATE_TWO_VIEW_GEOMETRIES_TABLE
-        )
-        self.create_keypoints_table = lambda: self.executescript(CREATE_KEYPOINTS_TABLE)
-        self.create_matches_table = lambda: self.executescript(CREATE_MATCHES_TABLE)
-        self.create_name_index = lambda: self.executescript(CREATE_NAME_INDEX)
+    def create_tables(self):
+        for sql in COLMAP_SCHEMA.values():
+            self.execute(sql)
+        for sql in COLMAP_INDEXES:
+            self.execute(sql)
+        self.commit()
 
     def update_camera(self, model, width, height, params, camera_id):
         params = np.asarray(params, np.float64)
@@ -131,9 +195,6 @@ class COLMAPDatabase(sqlite3.Connection):
 
 
 def camTodatabase(txtfile, database_path):
-    import os
-    import argparse
-
     camModelDict = {
         "SIMPLE_PINHOLE": 0,
         "PINHOLE": 1,
@@ -148,44 +209,35 @@ def camTodatabase(txtfile, database_path):
         "THIN_PRISM_FISHEYE": 10,
     }
 
-    if os.path.exists(database_path) == False:
-        print("ERROR: database path dosen't exist -- please check database.db.")
+    if not os.path.exists(database_path):
+        print("ERROR: database path doesn't exist -- please check database.db.")
         return
-    # Open the database.
+
     db = COLMAPDatabase.connect(database_path)
 
-    idList = list()
-    modelList = list()
-    widthList = list()
-    heightList = list()
-    paramsList = list()
-    # Update real cameras from .txt
+    idList, modelList, widthList, heightList, paramsList = [], [], [], [], []
     with open(txtfile, "r") as cam:
-        lines = cam.readlines()
-        for i in range(0, len(lines), 1):
-            if lines[i][0] != "#":
-                strLists = lines[i].split()
-                cameraId = int(strLists[0])
-                cameraModel = camModelDict[strLists[1]]  # SelectCameraModel
-                width = int(strLists[2])
-                height = int(strLists[3])
-                paramstr = np.array(strLists[4:12])
-                params = paramstr.astype(np.float64)
-                idList.append(cameraId)
-                modelList.append(cameraModel)
-                widthList.append(width)
-                heightList.append(height)
-                paramsList.append(params)
-                camera_id = db.update_camera(
-                    cameraModel, width, height, params, cameraId
-                )
+        for line in cam.readlines():
+            if line.startswith("#"):
+                continue
+            strLists = line.split()
+            cameraId = int(strLists[0])
+            cameraModel = camModelDict[strLists[1]]
+            width = int(strLists[2])
+            height = int(strLists[3])
+            params = np.array(strLists[4:12]).astype(np.float64)
+            idList.append(cameraId)
+            modelList.append(cameraModel)
+            widthList.append(width)
+            heightList.append(height)
+            paramsList.append(params)
+            db.update_camera(cameraModel, width, height, params, cameraId)
 
-    # Commit the data to the file.
     db.commit()
-    # Read and check cameras.
+
     rows = db.execute("SELECT * FROM cameras")
-    for i in range(0, len(idList), 1):
-        camera_id, model, width, height, params, prior = next(rows)
+    for i in range(len(idList)):
+        camera_id, model, width, height, params, _ = next(rows)
         params = blob_to_array(params, np.float64)
         assert camera_id == idList[i]
         assert (
@@ -193,7 +245,6 @@ def camTodatabase(txtfile, database_path):
         )
         assert np.allclose(params, paramsList[i])
 
-    # Close database.db.
     db.close()
 
 
@@ -230,78 +281,44 @@ def rotmat(a, b):
     return np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s**2 + 1e-10))
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()  # TODO: refine it.
-    parser.add_argument("path", default="", help="input path to the video")
-    args = parser.parse_args()
-
-    # path must end with / to make sure image path is relative
-    if args.path[-1] != "/":
-        args.path += "/"
-
-    # extract images
-    videos = [
-        os.path.join(args.path, vname)
-        for vname in os.listdir(args.path)
-        if vname.endswith(".mp4")
-    ]
-    images_path = os.path.join(args.path, "images/")
-    if not os.path.exists(images_path) and len(os.listdir(images_path)) == 0:
-        os.makedirs(images_path, exist_ok=True)
-
-        for video in videos:
-            cam_name = video.split("/")[-1].split(".")[-2]
-            do_system(
-                f"ffmpeg -i {video} -start_number 0 {images_path}/{cam_name}_%04d.png"
-            )
-
-    # load data
+def build_transforms(args_path):
+    """Compute train/test transforms from poses_bounds.npy + image listing. Idempotent."""
     images = [
-        f[len(args.path) :]
-        for f in sorted(glob.glob(os.path.join(args.path, "images/", "*")))
-        if f.lower().endswith("png")
-        or f.lower().endswith("jpg")
-        or f.lower().endswith("jpeg")
+        f[len(args_path) :]
+        for f in sorted(glob.glob(os.path.join(args_path, "images", "*")))
+        if f.lower().endswith(("png", "jpg", "jpeg"))
     ]
     cams = sorted(set([im[7:12] for im in images]))
 
-    poses_bounds = np.load(os.path.join(args.path, "poses_bounds.npy"))
+    poses_bounds = np.load(os.path.join(args_path, "poses_bounds.npy"))
     N = poses_bounds.shape[0]
-
     print(
         f"[INFO] loaded {len(images)} images from {len(cams)} videos, {N} poses_bounds as {poses_bounds.shape}"
     )
-
     assert N == len(cams)
 
     poses = poses_bounds[:, :15].reshape(-1, 3, 5)  # (N, 3, 5)
-    bounds = poses_bounds[:, -2:]  # (N, 2)
-
     H, W, fl = poses[0, :, -1]
-
     print(f"[INFO] H = {H}, W = {W}, fl = {fl}")
 
-    # inversion of this: https://github.com/Fyusion/LLFF/blob/c6e27b1ee59cb18f054ccb0f87a90214dbe70482/llff/poses/pose_utils.py#L51
+    # inversion of https://github.com/Fyusion/LLFF/blob/c6e27b1ee59cb18f054ccb0f87a90214dbe70482/llff/poses/pose_utils.py#L51
     poses = np.concatenate(
         [poses[..., 1:2], poses[..., 0:1], -poses[..., 2:3], poses[..., 3:4]], -1
-    )  # (N, 3, 4)
-
-    # to homogeneous
-    last_row = np.tile(np.array([0, 0, 0, 1]), (len(poses), 1, 1))  # (N, 1, 4)
+    )
+    last_row = np.tile(np.array([0, 0, 0, 1]), (len(poses), 1, 1))
     poses = np.concatenate([poses, last_row], axis=1)  # (N, 4, 4)
 
-    # the following stuff are from colmap2nerf...
+    # colmap2nerf-style axis fixups
     poses[:, 0:3, 1] *= -1
     poses[:, 0:3, 2] *= -1
-    poses = poses[:, [1, 0, 2, 3], :]  # swap y and z
-    poses[:, 2, :] *= -1  # flip whole world upside down
+    poses = poses[:, [1, 0, 2, 3], :]
+    poses[:, 2, :] *= -1
 
     up = poses[:, 0:3, 1].sum(0)
     up = up / np.linalg.norm(up)
-    R = rotmat(up, [0, 0, 1])  # rotate up vector to [0,0,1]
+    R = rotmat(up, [0, 0, 1])
     R = np.pad(R, [0, 1])
     R[-1, -1] = 1
-
     poses = R @ poses
 
     totw = 0.0
@@ -311,7 +328,6 @@ if __name__ == "__main__":
         for j in range(i + 1, N):
             mg = poses[j, :3, :]
             p, w = closest_point_2_lines(mf[:, 3], mf[:, 2], mg[:, 3], mg[:, 2])
-            # print(i, j, p, w)
             if w > 0.01:
                 totp += p * w
                 totw += w
@@ -320,13 +336,10 @@ if __name__ == "__main__":
     poses[:, :3, 3] -= totp
 
     avglen = np.linalg.norm(poses[:, :3, 3], axis=-1).mean()
-
     poses[:, :3, 3] *= 4.0 / avglen
-
     print(f"[INFO] average radius = {avglen}")
 
-    train_frames = []
-    test_frames = []
+    train_frames, test_frames = [], []
     for i in range(N):
         cam_frames = [
             {
@@ -342,121 +355,174 @@ if __name__ == "__main__":
         else:
             train_frames += cam_frames
 
-    train_transforms = {
-        "w": W,
-        "h": H,
-        "fl_x": fl,
-        "fl_y": fl,
-        "cx": W // 2,
-        "cy": H // 2,
-        "frames": train_frames,
-    }
-    test_transforms = {
-        "w": W,
-        "h": H,
-        "fl_x": fl,
-        "fl_y": fl,
-        "cx": W // 2,
-        "cy": H // 2,
-        "frames": test_frames,
-    }
+    common = {"w": W, "h": H, "fl_x": fl, "fl_y": fl, "cx": W // 2, "cy": H // 2}
+    return {**common, "frames": train_frames}, {**common, "frames": test_frames}
 
-    train_output_path = os.path.join(args.path, "transforms_train.json")
-    test_output_path = os.path.join(args.path, "transforms_test.json")
-    print(f"[INFO] write to {train_output_path} and {test_output_path}")
-    with open(train_output_path, "w") as f:
-        json.dump(train_transforms, f, indent=2)
-    with open(test_output_path, "w") as f:
-        json.dump(test_transforms, f, indent=2)
 
-    colmap_workspace = os.path.join(args.path, "tmp")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", default="", help="input path to the video")
+    args = parser.parse_args()
+
+    if args.path[-1] != "/":
+        args.path += "/"
+
+    # ---- compatibility / sanity checks ----
+    colmap_version = check_colmap_compat()
+    print(f"[INFO] COLMAP {colmap_version}")
+    print(f"[INFO] NumPy {np.__version__}")
+
+    # ---- paths (everything lives directly under args.path) ----
+    images_path = os.path.join(args.path, "images")
+    train_json = os.path.join(args.path, "transforms_train.json")
+    test_json = os.path.join(args.path, "transforms_test.json")
+    points_ply = os.path.join(args.path, "points3d.ply")
+    db_path = os.path.join(args.path, "database.db")
+    sparse_in = os.path.join(args.path, "sparse_in")   # manual model w/ known poses
+    sparse_out = os.path.join(args.path, "sparse")     # triangulated model
+    dense_dir = os.path.join(args.path, "dense")       # MVS workspace
+    cameras_txt = os.path.join(sparse_in, "cameras.txt")
+    images_txt = os.path.join(sparse_in, "images.txt")
+    points3d_txt = os.path.join(sparse_in, "points3D.txt")
+    image_list_txt = os.path.join(sparse_in, "image_list.txt")
+
+    # ---- step 1: extract frames from .mp4 with ffmpeg ----
+    if not os.path.exists(images_path) or not os.listdir(images_path):
+        os.makedirs(images_path, exist_ok=True)
+        videos = [
+            os.path.join(args.path, v)
+            for v in os.listdir(args.path)
+            if v.endswith(".mp4")
+        ]
+        for video in videos:
+            cam_name = video.split("/")[-1].split(".")[-2]
+            do_system(
+                f"ffmpeg -i {video} -start_number 0 {images_path}/{cam_name}_%04d.png"
+            )
+    else:
+        print(f"[SKIP] ffmpeg extraction: {images_path} already populated")
+
+    # ---- step 2: train/test transforms (cached as JSON) ----
+    if os.path.exists(train_json) and os.path.exists(test_json):
+        print(f"[SKIP] transforms_*.json already exist")
+        with open(train_json) as f:
+            train_transforms = json.load(f)
+        with open(test_json) as f:
+            test_transforms = json.load(f)
+    else:
+        train_transforms, test_transforms = build_transforms(args.path)
+        print(f"[INFO] write {train_json} and {test_json}")
+        with open(train_json, "w") as f:
+            json.dump(train_transforms, f, indent=2)
+        with open(test_json, "w") as f:
+            json.dump(test_transforms, f, indent=2)
+
+    # ---- step 3: stop if final point cloud already exists ----
+    if os.path.exists(points_ply):
+        print(f"[SKIP] COLMAP pipeline: {points_ply} already exists")
+        sys.exit(0)
+
+    # ---- step 4: prepare the manual sparse model (cameras.txt / images.txt) ----
+    W = int(train_transforms["w"])
+    H = int(train_transforms["h"])
+    cx, cy = train_transforms["cx"], train_transforms["cy"]
+    fx, fy = train_transforms["fl_x"], train_transforms["fl_y"]
     blender2opencv = np.array(
         [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]
     )
-    W, H, cx, cy, fx, fy = (
-        int(W),
-        int(H),
-        train_transforms["cx"],
-        train_transforms["cy"],
-        train_transforms["fl_x"],
-        train_transforms["fl_y"],
-    )
-    os.makedirs(os.path.join(colmap_workspace, "created", "sparse"), exist_ok=True)
+
+    os.makedirs(sparse_in, exist_ok=True)
 
     fname2pose = {}
-    with open(os.path.join(colmap_workspace, "created/sparse/cameras.txt"), "w") as f:
-        f.write(f"1 PINHOLE {W} {H} {fx} {fy} {cx} {cy}")
-        for frame in train_frames:
-            if frame["time"] == 0:
-                fname = frame["file_path"].split("/")[-1] + ".png"
-                pose = np.array(frame["transform_matrix"]) @ blender2opencv
-                fname2pose.update({fname: pose})
+    for frame in train_transforms["frames"]:
+        if frame["time"] == 0:
+            fname = frame["file_path"].split("/")[-1] + ".png"
+            fname2pose[fname] = np.array(frame["transform_matrix"]) @ blender2opencv
 
-    os.makedirs(os.path.join(colmap_workspace, "images"), exist_ok=True)
-    for fname in fname2pose.keys():
-        os.symlink(
-            os.path.abspath(os.path.join(images_path, fname)),
-            os.path.join(colmap_workspace, "images", fname),
+    if not os.path.exists(cameras_txt):
+        with open(cameras_txt, "w") as f:
+            f.write(f"1 PINHOLE {W} {H} {fx} {fy} {cx} {cy}")
+
+    # `--image_list_path` filters which images COLMAP scans from `images/` —
+    # avoids the symlink / tmp-folder dance and avoids feature-extracting every
+    # frame of every video.
+    if not os.path.exists(image_list_txt):
+        with open(image_list_txt, "w") as f:
+            for fname in fname2pose:
+                f.write(f"{fname}\n")
+
+    if not os.path.exists(images_txt):
+        with open(images_txt, "w") as f:
+            for idx, (fname, pose) in enumerate(fname2pose.items(), start=1):
+                R = np.linalg.inv(pose[:3, :3])
+                T = -np.matmul(R, pose[:3, 3])
+                q0 = 0.5 * math.sqrt(1 + R[0, 0] + R[1, 1] + R[2, 2])
+                q1 = (R[2, 1] - R[1, 2]) / (4 * q0)
+                q2 = (R[0, 2] - R[2, 0]) / (4 * q0)
+                q3 = (R[1, 0] - R[0, 1]) / (4 * q0)
+                f.write(f"{idx} {q0} {q1} {q2} {q3} {T[0]} {T[1]} {T[2]} 1 {fname}\n\n")
+
+    if not os.path.exists(points3d_txt):
+        open(points3d_txt, "w").close()
+
+    # ---- step 5: SfM (feature + match), reading directly from data_root/images ----
+    if not os.path.exists(db_path):
+        # --ImageReader.single_camera=1 → one shared camera (and one rig) across
+        # all images, matching the single PINHOLE entry in cameras.txt. Otherwise
+        # COLMAP 3.10+ creates one camera/rig per image and Reconstruction::Load()
+        # in point_triangulator rejects the rig mismatch against our text model.
+        do_system(
+            f"colmap feature_extractor "
+            f"--database_path {db_path} "
+            f"--image_path {images_path} "
+            f"--image_list_path {image_list_txt} "
+            f"--ImageReader.single_camera 1"
         )
+        camTodatabase(cameras_txt, db_path)
+        do_system(f"colmap exhaustive_matcher --database_path {db_path}")
+    else:
+        print(f"[SKIP] feature_extractor + matcher: {db_path} exists")
 
-    with open(os.path.join(colmap_workspace, "created/sparse/images.txt"), "w") as f:
-        idx = 1
-        for fname in fname2pose.keys():
-            pose = fname2pose[fname]
-            R = np.linalg.inv(pose[:3, :3])
-            T = -np.matmul(R, pose[:3, 3])
-            q0 = 0.5 * math.sqrt(1 + R[0, 0] + R[1, 1] + R[2, 2])
-            q1 = (R[2, 1] - R[1, 2]) / (4 * q0)
-            q2 = (R[0, 2] - R[2, 0]) / (4 * q0)
-            q3 = (R[1, 0] - R[0, 1]) / (4 * q0)
+    # ---- step 6: triangulate with known poses ----
+    if not os.path.exists(sparse_out) or not os.listdir(sparse_out):
+        os.makedirs(sparse_out, exist_ok=True)
+        do_system(
+            f"colmap point_triangulator "
+            f"--database_path {db_path} "
+            f"--image_path {images_path} "
+            f"--input_path {sparse_in} "
+            f"--output_path {sparse_out}"
+        )
+        do_system(
+            f"colmap model_converter "
+            f"--input_path {sparse_out} "
+            f"--output_path {sparse_out} "
+            f"--output_type TXT"
+        )
+    else:
+        print(f"[SKIP] point_triangulator: {sparse_out} populated")
 
-            f.write(f"{idx} {q0} {q1} {q2} {q3} {T[0]} {T[1]} {T[2]} 1 {fname}\n\n")
-            idx += 1
+    # ---- step 7: MVS (undistort + patch_match + fusion) ----
+    if not os.path.exists(dense_dir) or not os.listdir(dense_dir):
+        os.makedirs(dense_dir, exist_ok=True)
+        do_system(
+            f"colmap image_undistorter "
+            f"--image_path {images_path} "
+            f"--input_path {sparse_out} "
+            f"--output_path {dense_dir}"
+        )
+        do_system(f"colmap patch_match_stereo --workspace_path {dense_dir}")
+    else:
+        print(f"[SKIP] image_undistorter + patch_match_stereo: {dense_dir} populated")
 
-    with open(os.path.join(colmap_workspace, "created/sparse/points3D.txt"), "w") as f:
-        f.write("")
-
-    db_path = os.path.join(colmap_workspace, "database.db")
-
-    do_system(f"colmap feature_extractor \
-                --database_path {db_path} \
-                --image_path {os.path.join(colmap_workspace, 'images')}")
-
-    camTodatabase(os.path.join(colmap_workspace, "created/sparse/cameras.txt"), db_path)
-
-    do_system(f"colmap exhaustive_matcher  \
-                --database_path {db_path}")
-
-    os.makedirs(os.path.join(colmap_workspace, "triangulated", "sparse"), exist_ok=True)
-
-    do_system(f"colmap point_triangulator   \
-                --database_path {db_path} \
-                --image_path {os.path.join(colmap_workspace, 'images')} \
-                --input_path  {os.path.join(colmap_workspace, 'created/sparse')} \
-                --output_path  {os.path.join(colmap_workspace, 'triangulated/sparse')}")
-
-    do_system(f"colmap model_converter \
-                --input_path  {os.path.join(colmap_workspace, 'triangulated/sparse')} \
-                --output_path  {os.path.join(colmap_workspace, 'created/sparse')} \
-                --output_type TXT")
-
-    os.makedirs(os.path.join(colmap_workspace, "dense"), exist_ok=True)
-
-    do_system(f"colmap image_undistorter  \
-                --image_path  {os.path.join(colmap_workspace, 'images')} \
-                --input_path  {os.path.join(colmap_workspace, 'created/sparse')} \
-                --output_path  {os.path.join(colmap_workspace, 'dense')}")
-
-    do_system(f"colmap patch_match_stereo   \
-                --workspace_path   {os.path.join(colmap_workspace, 'dense')}")
-
-    do_system(f"colmap stereo_fusion    \
-                --workspace_path {os.path.join(colmap_workspace, 'dense')} \
-                --output_path {os.path.join(args.path, 'points3d.ply')}")
-
-    shutil.rmtree(colmap_workspace)
-    os.remove(os.path.join(args.path, "points3d.ply.vis"))
-
-    print(
-        f"[INFO] Initial point cloud is saved in {os.path.join(args.path, 'points3d.ply')}."
+    do_system(
+        f"colmap stereo_fusion "
+        f"--workspace_path {dense_dir} "
+        f"--output_path {points_ply}"
     )
+
+    vis_path = points_ply + ".vis"
+    if os.path.exists(vis_path):
+        os.remove(vis_path)
+
+    print(f"[INFO] Initial point cloud is saved in {points_ply}.")
