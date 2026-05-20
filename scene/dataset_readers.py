@@ -254,9 +254,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             if norm_data[:, :, 3:4].min() < 1:
                 arr = np.concatenate([arr, norm_data[:, :, 3:4]], axis=2)
-                image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGBA")
+                image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGBA")
             else:
-                image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+                image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
 
             width, height = image.size[0], image.size[1]
         else:

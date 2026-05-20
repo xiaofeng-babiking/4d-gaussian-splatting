@@ -14,6 +14,7 @@ docker run -it --rm \
 --env HOST_USER_ID=$(id -u) \
 --env HOST_GROUP_ID=$(id -g) \
 --env HOME=/tmp \
+--env USER=$(whoami) \
 --env TORCH_EXTENSIONS_DIR=/workspace/.torch_extensions \
 --privileged \
 -v $(pwd):/workspace \
