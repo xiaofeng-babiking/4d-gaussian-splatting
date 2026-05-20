@@ -27,3 +27,4 @@ eggs/
 .mcp.json
 .claude
 .venv
+.torch_extensions/

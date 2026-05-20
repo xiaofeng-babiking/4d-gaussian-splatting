@@ -14,14 +14,24 @@ docker run -it --rm \
 --env HOST_USER_ID=$(id -u) \
 --env HOST_GROUP_ID=$(id -g) \
 --env HOME=/tmp \
+--env TORCH_EXTENSIONS_DIR=/workspace/.torch_extensions \
 --privileged \
 -v $(pwd):/workspace \
 -v /jfs:/jfs \
-babiking/ubuntu:12.8.1-cudnn-devel-ubuntu24.04-gsplat1.5.2 /bin/bash
+babiking/ubuntu:12.8.1-cudnn-devel-ubuntu24.04 /bin/bash
 
-# One-time setup after first launch (re-run after every `docker rm ironman`):
-#   # Symlink colmap onto PATH (its real binary lives in babiking's home).
-#   docker exec -u 0 ironman ln -sf /home/babiking/install/colmap/bin/colmap /usr/local/bin/colmap
+# This image variant already bakes in:
+#   /usr/local/bin/colmap -> /home/babiking/install/colmap/bin/colmap
+# so no post-start `docker exec -u 0 ... ln -sf ...` step is needed any more.
+
+# Resuming the uv env inside the new container:
+#   source /workspace/.venv/bin/activate
+#   # — or invoke directly: /workspace/.venv/bin/python train.py ...
+# The .venv lives on the host bind-mount, so it survives `docker rm` and is
+# immediately ready in any container that mounts the project at /workspace.
+# JIT-built CUDA extensions (diff_gaussian_rasterization) are cached in
+# /workspace/.torch_extensions/ via the env var above — also bind-mounted, so
+# the first-run ~60 s compile happens only once per host, not per container.
 
 # Optional X11 flags above (forwards DISPLAY at container start; goes stale on re-SSH):
 # --env DISPLAY=$DISPLAY \
