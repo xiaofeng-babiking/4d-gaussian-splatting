@@ -18,6 +18,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <vector>
 #include <cuda_runtime_api.h>
+#include <cfloat>  // for FLT_MAX (GCC 13+ no longer transitively includes it)
 #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
 #define __CUDACC__

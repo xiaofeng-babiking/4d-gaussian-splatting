@@ -16,7 +16,10 @@ dependencies = [
     "numpy>=1.26,<3",
     "simple-knn",
     "pointops2",
-    "diff-gaussian-rasterization",
+    # diff-gaussian-rasterization is NOT a pip dep: gaussian_renderer/diff_gaussian_rasterization.py
+    # JIT-compiles the CUDA sources at first import via torch.utils.cpp_extension.load().
+    # Its in-tree setup.py is vestigial from upstream Inria 3DGS and would fail (no
+    # diff_gaussian_rasterization/ Python package dir in this repo).
 ]
 
 [tool.uv]
@@ -24,7 +27,6 @@ package = false
 no-build-isolation-package = [
     "simple-knn",
     "pointops2",
-    "diff-gaussian-rasterization",
 ]
 
 [tool.uv.sources]
@@ -32,8 +34,17 @@ torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 simple-knn = { path = "./simple-knn" }
 pointops2 = { path = "./pointops2" }
-diff-gaussian-rasterization = { path = "./diff-gaussian-rasterization" }
 
+[[tool.uv.index]]
+name = "aliyun-pypi"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+# Pytorch's CUDA wheels are not exposed as a PEP-503 index by Aliyun's mirror —
+# we keep the official URL here for *resolution* so uv lock can find versions /
+# read METADATA. The actual wheel URLs in uv.lock are then rewritten to
+# mirrors.aliyun.com/pytorch-wheels/cu128/<file> (byte-identical mirror) for
+# fast downloads. See scripts/uv_lock_swap_mirror.sh (or the sed command).
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
@@ -50,8 +61,3 @@ requires-dist = ["torch"]
 name = "pointops2"
 version = "1.0"
 requires-dist = ["torch", "numpy"]
-
-[[tool.uv.dependency-metadata]]
-name = "diff-gaussian-rasterization"
-version = "0.0.0"
-requires-dist = ["torch"]

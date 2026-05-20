@@ -43,11 +43,17 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, num_pts_ratio=num_pts_ratio)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        # Prefer the Blender-style schema (transforms_*.json + points3d.ply at root)
+        # whenever present — that's what scripts/n3v2blender.py produces for N3V scenes,
+        # and it carries the per-frame `time` field that 4DGS needs. Only fall back to
+        # the Colmap layout (sparse/0/{cameras,images,points3D}.{bin,txt}) when the
+        # JSON pair is absent, since a 4DGS data root may *also* contain a flat sparse/
+        # directory as a side-effect of the COLMAP scaffold step.
+        if os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, num_pts=num_pts, time_duration=time_duration, extension=args.extension, num_extra_pts=args.num_extra_pts, frame_ratio=args.frame_ratio, dataloader=args.dataloader)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, num_pts_ratio=num_pts_ratio)
         else:
             assert False, "Could not recognize scene type!"
 

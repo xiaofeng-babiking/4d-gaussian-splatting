@@ -13,6 +13,7 @@
 
 #include <iostream>
 #include <vector>
+#include <cstdint>  // uint32_t/uint64_t/uintptr_t (GCC 13+ no longer transitively includes)
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
 
