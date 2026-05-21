@@ -10,7 +10,6 @@ docker run -it --rm \
 --network host \
 --shm-size 8G \
 --user $(id -u):$(id -g) \
---group-add babiking \
 --env HOST_USER_ID=$(id -u) \
 --env HOST_GROUP_ID=$(id -g) \
 --env HOME=/tmp \
