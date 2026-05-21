@@ -62,3 +62,15 @@ requires-dist = ["torch"]
 name = "pointops2"
 version = "1.0"
 requires-dist = ["torch", "numpy"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+# Skip vendored third-party CUDA extensions and dataset/output dirs so a stray
+# `black .` from CLI never reformats upstream code we don't own.
+extend-exclude = '''
+(
+  /(diff-gaussian-rasterization|pointops2|simple-knn|lpipsPyTorch)/
+  | /(output|data|\.venv)/
+)
+'''
