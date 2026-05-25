@@ -21,6 +21,7 @@ dependencies = [
     # JIT-compiles the CUDA sources at first import via torch.utils.cpp_extension.load().
     # Its in-tree setup.py is vestigial from upstream Inria 3DGS and would fail (no
     # diff_gaussian_rasterization/ Python package dir in this repo).
+    "gsplat>=1.5",
 ]
 
 [tool.uv]
