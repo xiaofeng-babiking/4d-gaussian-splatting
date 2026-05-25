@@ -70,7 +70,10 @@ def sample_4dgs_params_by_t(gaussians, timestamp):
         baked = sh_full[:, :spatial_n, :].clone()
         for k in range(1, gaussians.max_sh_degree_t + 1):
             mod = torch.cos(2 * torch.pi * k * dir_t / L)
-            baked = baked + mod[:, :, None] * sh_full[:, k * spatial_n : (k + 1) * spatial_n, :]
+            baked = (
+                baked
+                + mod[:, :, None] * sh_full[:, k * spatial_n : (k + 1) * spatial_n, :]
+            )
         features_dc = baked[:, :1, :].detach()
         features_rest = baked[:, 1:, :].detach()
     else:
@@ -89,13 +92,41 @@ def sample_4dgs_params_by_t(gaussians, timestamp):
         }
 
     # rot_4d=True: condition on t to drift position and reshape spatial cov.
-    cond_cov, delta_mean = gaussians.get_current_covariance_and_mean_offset(
+    cond_cov_symm, delta_mean = gaussians.get_current_covariance_and_mean_offset(
         scaling_modifier=1.0, timestamp=t
     )
     xyz = (gaussians._xyz + delta_mean).detach()
 
     # Sigma_xx|t = V diag(lambda) V^T  ->  s = sqrt(lambda), R = V (det=+1).
-    eigvals, eigvecs = torch.linalg.eigh(cond_cov)
+    # The covariance comes back as [N, 6] upper-triangle (strip_lowerdiag layout:
+    # [c00, c01, c02, c11, c12, c22]) since the rasterizer consumes the packed form.
+    # Mirror it back to a full symmetric [N, 3, 3] for eigh.
+    cond_cov = torch.empty(
+        cond_cov_symm.shape[0], 3, 3,
+        device=cond_cov_symm.device, dtype=cond_cov_symm.dtype,
+    )
+    cond_cov[:, 0, 0] = cond_cov_symm[:, 0]
+    cond_cov[:, 0, 1] = cond_cov_symm[:, 1]
+    cond_cov[:, 1, 0] = cond_cov_symm[:, 1]
+    cond_cov[:, 0, 2] = cond_cov_symm[:, 2]
+    cond_cov[:, 2, 0] = cond_cov_symm[:, 2]
+    cond_cov[:, 1, 1] = cond_cov_symm[:, 3]
+    cond_cov[:, 1, 2] = cond_cov_symm[:, 4]
+    cond_cov[:, 2, 1] = cond_cov_symm[:, 4]
+    cond_cov[:, 2, 2] = cond_cov_symm[:, 5]
+    # Sanitize: gaussians with near-zero temporal scaling produce inf/nan after
+    # cov_xt cov_xt^T / cov_tt. Replace junk with zero, then add a 1e-8 identity
+    # so eigh always succeeds (degenerate rows collapse to tiny isotropic scales).
+    cond_cov = torch.nan_to_num(cond_cov, nan=0.0, posinf=0.0, neginf=0.0)
+    cond_cov = cond_cov + 1e-8 * torch.eye(
+        3, device=cond_cov.device, dtype=cond_cov.dtype
+    )
+    # CPU round-trip: cusolverDnXsyevBatched hits INVALID_VALUE on the 4M-batch
+    # input. LAPACK on host handles it without issue (~160 MB transfer, dwarfed
+    # by the ~900 MB PLY write that follows).
+    eigvals_cpu, eigvecs_cpu = torch.linalg.eigh(cond_cov.cpu())
+    eigvals = eigvals_cpu.to(cond_cov.device)
+    eigvecs = eigvecs_cpu.to(cond_cov.device)
     det = torch.linalg.det(eigvecs)
     sign = torch.sign(det).unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
     eigvecs = torch.cat([eigvecs[:, :, :2], eigvecs[:, :, 2:3] * sign], dim=2)
@@ -173,8 +204,16 @@ def dump_supersplat_ply_file(path, params):
     opacity = params["opacity"].cpu().numpy()
     # SH layout: [N, K, 3] -> transpose -> [N, 3, K] -> flatten gives channel-major
     # (ch0 K coeffs, ch1 K coeffs, ch2 K coeffs) matching the 3DGS reference exporter.
-    features_dc = params["features_dc"].cpu().numpy().transpose(0, 2, 1).reshape(xyz.shape[0], -1)
-    features_rest = params["features_rest"].cpu().numpy().transpose(0, 2, 1).reshape(xyz.shape[0], -1)
+    features_dc = (
+        params["features_dc"].cpu().numpy().transpose(0, 2, 1).reshape(xyz.shape[0], -1)
+    )
+    features_rest = (
+        params["features_rest"]
+        .cpu()
+        .numpy()
+        .transpose(0, 2, 1)
+        .reshape(xyz.shape[0], -1)
+    )
 
     dtype = [("x", "f4"), ("y", "f4"), ("z", "f4")]
     dtype += [(f"scale_{i}", "f4") for i in range(scaling.shape[1])]
@@ -314,10 +353,13 @@ def evaluate(
                 # Dump SuperSplat PLY of the 4DGS sampled at this frame's t.
                 # NOTE: each PLY is ~(num_gaussians * 51) floats; can be very large
                 # at full test-set cadence. Comment this block out to skip.
-                params_at_t = sample_4dgs_params_by_t(gaussians, viewpoint.timestamp)
-                dump_supersplat_ply_file(
-                    os.path.join(render_dir, basename + ".ply"), params_at_t
-                )
+                if int(batch_idx) % 10 == 0:
+                    params_at_t = sample_4dgs_params_by_t(
+                        gaussians, viewpoint.timestamp
+                    )
+                    dump_supersplat_ply_file(
+                        os.path.join(render_dir, basename + ".ply"), params_at_t
+                    )
 
                 l1_cur = l1_loss(image, gt_image).mean().double()
                 l1_acc += l1_cur
