@@ -17,6 +17,7 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
+from torch.utils.data import DataLoader
 
 from utils.loss_utils import l1_loss, ssim, msssim
 from utils.image_utils import psnr
@@ -64,8 +65,12 @@ def evaluate(
             num_pts=num_pts,
             num_pts_ratio=num_pts_ratio,
             time_duration=time_duration,
+            skip_train_cams=True,
         )
-        model_params, ckpt_iter = torch.load(checkpoint)
+        # weights_only=False: torch 2.6+ flipped the default to True (security), which
+        # refuses to unpickle the numpy scalars + Python tuple that gaussians.capture()
+        # produces. The checkpoint is trusted (we wrote it via train.py).
+        model_params, ckpt_iter = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, training_args=None)
         print("Loaded checkpoint from iteration {}: {}".format(ckpt_iter, checkpoint))
     else:
@@ -78,6 +83,7 @@ def evaluate(
             num_pts=num_pts,
             num_pts_ratio=num_pts_ratio,
             time_duration=time_duration,
+            skip_train_cams=True,
         )
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -95,7 +101,11 @@ def evaluate(
                 else []
             ),
         },
-        {"name": "test", "cameras": [test_cams[idx] for idx in range(len(test_cams))]},
+        # Pass the CameraDataset directly (not a list comprehension) — its
+        # __getitem__ decodes a ~2 MP JPEG from /jfs on each access, which takes
+        # ~3 s per camera. Eager materialization of all 300 test cams burns ~18 min
+        # before tqdm even starts. Lazy iteration overlaps decode with rendering.
+        {"name": "test", "cameras": test_cams},
     )
 
     with torch.no_grad():
@@ -106,8 +116,21 @@ def evaluate(
             psnr_acc = 0.0
             ssim_acc = 0.0
             msssim_acc = 0.0
-            for batch_data in tqdm(
-                config["cameras"], desc="Evaluating {}".format(config["name"])
+            # Parallel-decode the 2704x2028 PNGs in worker processes so the slow
+            # PIL decode + resize (~7 s each on this dataset) overlaps with GPU
+            # render. Without this, eval is decode-bound at ~15 s/iter on N3V.
+            loader = DataLoader(
+                config["cameras"],
+                batch_size=1,
+                num_workers=8,
+                collate_fn=lambda x: x[0],
+            )
+            for batch_idx, batch_data in enumerate(
+                tqdm(
+                    loader,
+                    total=len(config["cameras"]),
+                    desc="Evaluating {}".format(config["name"]),
+                )
             ):
                 gt_image, viewpoint = batch_data
                 gt_image = gt_image.cuda()
@@ -116,10 +139,23 @@ def evaluate(
                 render_pkg = render(viewpoint, gaussians, pipe, background)
                 image = torch.clamp(render_pkg["render"], 0.0, 1.0)
 
-                l1_acc += l1_loss(image, gt_image).mean().double()
-                psnr_acc += psnr(image, gt_image).mean().double()
-                ssim_acc += ssim(image, gt_image).mean().double()
-                msssim_acc += msssim(image[None].cpu(), gt_image[None].cpu())
+                l1_cur = l1_loss(image, gt_image).mean().double()
+                l1_acc += l1_cur
+
+                psnr_cur = psnr(image, gt_image).mean().double()
+                psnr_acc += psnr_cur
+
+                ssim_cur = ssim(image, gt_image).mean().double()
+                ssim_acc += ssim_cur
+
+                mssim_cur = msssim(image[None].cpu(), gt_image[None].cpu())
+                msssim_acc += mssim_cur
+
+                print(
+                    f"Indedx={batch_idx}, "
+                    + f"L1={l1_cur:.4f}, PSNR={psnr_cur:.4f}, "
+                    + f"SSIM={ssim_cur:.4f}, mSSIM={mssim_cur:.4f}."
+                )
 
             n = len(config["cameras"])
             print(
@@ -170,29 +206,29 @@ if __name__ == "__main__":
         "to load (-1 = latest available)",
     )
 
-    parser.add_argument("--gaussian_dim", type=int, default=3)
-    parser.add_argument("--time_duration", nargs=2, type=float, default=[-0.5, 0.5])
-    parser.add_argument("--num_pts", type=int, default=100_000)
-    parser.add_argument("--num_pts_ratio", type=float, default=1.0)
-    parser.add_argument("--rot_4d", action="store_true")
-    parser.add_argument("--force_sh_3d", action="store_true")
     parser.add_argument("--seed", type=int, default=6666)
+    # Structural args (gaussian_dim, time_duration, num_pts, num_pts_ratio,
+    # rot_4d, force_sh_3d) intentionally NOT registered: they describe the
+    # tensor layout of the saved model and must come from the training-time
+    # source-of-truth (the --config YAML), not from CLI where a typo would
+    # silently mis-shape the parameters at load.
 
     args = parser.parse_args(sys.argv[1:])
 
     if args.config:
         cfg = OmegaConf.load(args.config)
 
-        # Soft merge: silently skip keys not registered on this parser (e.g.,
-        # OptimizationParams block, batch_size, exhaust_test). Lets train.py
-        # configs feed test.py without modification.
+        # Merge every leaf key onto args. Structural args (gaussian_dim,
+        # time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d) are no
+        # longer registered on argparse and land here. Unknown training-only
+        # keys (OptimizationParams block, batch_size, exhaust_test) also land
+        # but go unread.
         def recursive_merge(key, host):
             if isinstance(host[key], DictConfig):
                 for key1 in host[key].keys():
                     recursive_merge(key1, host[key])
             else:
-                if hasattr(args, key):
-                    setattr(args, key, host[key])
+                setattr(args, key, host[key])
 
         for k in cfg.keys():
             recursive_merge(k, cfg)

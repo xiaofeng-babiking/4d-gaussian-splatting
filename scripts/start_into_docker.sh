@@ -15,6 +15,7 @@ docker run -it --rm \
 --env HOME=/tmp \
 --env USER=$(whoami) \
 --env TORCH_EXTENSIONS_DIR=/workspace/.torch_extensions \
+--env PYTHONHOME=/workspace/.venv \
 --privileged \
 -v $(pwd):/workspace \
 -v /jfs:/jfs \
