@@ -22,6 +22,7 @@ dependencies = [
     # Its in-tree setup.py is vestigial from upstream Inria 3DGS and would fail (no
     # diff_gaussian_rasterization/ Python package dir in this repo).
     "gsplat>=1.5",
+    "viser>=0.2",
 ]
 
 [tool.uv]

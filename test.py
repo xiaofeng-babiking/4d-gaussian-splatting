@@ -26,7 +26,84 @@ from utils.image_utils import psnr
 from utils.general_utils import safe_state
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
+from scene.cameras import Camera
 from arguments import ModelParams, PipelineParams
+
+
+def make_round_trip_cameras(anchor_cam, num_frames, t_lo, t_hi, look_distance=2.0):
+    """Build a 360° orbital camera trajectory around the scene.
+
+    Frame 0 starts at `anchor_cam`'s pose so the orbit visually anchors against
+    a known test-set view. Subsequent frames orbit the focal point in the
+    horizontal plane (world +Z up, matching N3V/Blender). Time advances
+    linearly from `t_lo` to `t_hi` across the orbit, so the rendered video
+    shows spatial AND temporal change combined.
+
+    `look_distance` (default 2.0 world units) is how far ahead of the anchor
+    we place the orbit center. For N3V coffee_martini this lands roughly on
+    the bartender area; bump it for wider scenes, shrink for closer subjects.
+
+    Critical: FoVx/FoVy are set to -1 to match the codebase's latent FOV-clamp
+    behavior (forward.cu evaluates `tan(FoVx * 0.5)` for the projection clamp,
+    and the model is trained against `tan(-0.5) = -0.546` — passing positive
+    FoV shifts the render ~5 dB off). Real intrinsics still go through
+    `fl_x/fl_y/cx/cy` for the projection matrix itself.
+    """
+    R = np.asarray(anchor_cam.R, dtype=np.float64)
+    T = np.asarray(anchor_cam.T, dtype=np.float64)
+    pos0 = -R @ T
+    forward0 = R[:, 2]
+    focal_point = pos0 + forward0 * look_distance
+
+    z_axis = np.array([0.0, 0.0, 1.0])
+    radius_vec = pos0 - focal_point
+    height_offset = float(radius_vec @ z_axis)
+    horiz_vec = radius_vec - height_offset * z_axis
+
+    cameras = []
+    for i in range(num_frames):
+        theta = 2.0 * np.pi * i / num_frames
+        c, s = np.cos(theta), np.sin(theta)
+        Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        new_pos = focal_point + Rz @ horiz_vec + height_offset * z_axis
+
+        forward = focal_point - new_pos
+        forward /= np.linalg.norm(forward)
+        # If camera ends up nearly above/below the focal point, the world-Z
+        # cross product degenerates; fall back to +X as the up hint.
+        up_hint = np.array([1.0, 0.0, 0.0]) if abs(forward @ z_axis) > 0.999 else z_axis
+        right = np.cross(forward, up_hint)
+        right /= np.linalg.norm(right)
+        up_actual = np.cross(right, forward)
+
+        # OpenCV camera-local: X=right, Y=down, Z=forward.
+        R_c2w = np.stack([right, -up_actual, forward], axis=1)
+        T_w2c = -R_c2w.T @ new_pos
+
+        timestamp = t_lo + (t_hi - t_lo) * (i / max(num_frames - 1, 1))
+
+        cameras.append(
+            Camera(
+                colmap_id=i,
+                R=R_c2w.astype(np.float32),
+                T=T_w2c.astype(np.float32),
+                FoVx=-1.0,
+                FoVy=-1.0,
+                image=torch.empty(0),
+                gt_alpha_mask=None,
+                image_name=f"orbit_{i:04d}",
+                uid=i,
+                resolution=(anchor_cam.image_width, anchor_cam.image_height),
+                cx=anchor_cam.cx,
+                cy=anchor_cam.cy,
+                fl_x=anchor_cam.fl_x,
+                fl_y=anchor_cam.fl_y,
+                meta_only=True,
+                data_device="cuda",
+                timestamp=timestamp,
+            )
+        )
+    return cameras
 
 
 def evaluate(
@@ -40,6 +117,9 @@ def evaluate(
     num_pts_ratio,
     rot_4d,
     force_sh_3d,
+    add_orbit_trip=False,
+    orbit_trip_frames=60,
+    orbit_trip_look_distance=2.0,
 ):
     if dataset.frame_ratio > 1:
         time_duration = [
@@ -90,6 +170,32 @@ def evaluate(
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    if add_orbit_trip:
+        # Orbit-only mode: skip the test-cam eval entirely and render the
+        # 360° trajectory to <model_path>/orbit/. Frame 0 of the orbit matches
+        # the first test cam's pose, so visual sanity-check is direct.
+        anchor = scene.test_cameras[1.0][0]
+        t_lo, t_hi = float(time_duration[0]), float(time_duration[1])
+        orbit_cams = make_round_trip_cameras(
+            anchor, orbit_trip_frames, t_lo, t_hi, look_distance=orbit_trip_look_distance
+        )
+        orbit_dir = os.path.join(dataset.model_path, "orbit")
+        os.makedirs(orbit_dir, exist_ok=True)
+        print(
+            f"\nOrbit-only mode: {orbit_trip_frames} frames, "
+            f"t=[{t_lo:.3f}..{t_hi:.3f}], look_dist={orbit_trip_look_distance} -> {orbit_dir}"
+        )
+        with torch.no_grad():
+            for cam in tqdm(orbit_cams, desc="Round-trip"):
+                cam_cuda = cam.cuda()
+                pkg = render(cam_cuda, gaussians, pipe, background)
+                image = torch.clamp(pkg["render"], 0.0, 1.0)
+                angle_deg = round(360.0 * cam.uid / orbit_trip_frames)
+                fname = f"orbit_A{angle_deg:03d}_T{cam.timestamp:.3f}.png"
+                save_image(image, os.path.join(orbit_dir, fname))
+        torch.cuda.empty_cache()
+        return
 
     # Train-view sanity slice (5 samples) + full test set.
     train_cams = scene.getTrainCameras()
@@ -218,6 +324,26 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--seed", type=int, default=6666)
+    parser.add_argument(
+        "--add_orbit_trip",
+        action="store_true",
+        help="Skip the test-cam evaluation and instead render a 360° orbital "
+        "trajectory to <model_path>/orbit/. Useful for free-view inspection "
+        "of dynamic scenes without spinning up the live viewer.",
+    )
+    parser.add_argument(
+        "--orbit_trip_frames",
+        type=int,
+        default=60,
+        help="Number of frames in the orbital trajectory. 60 = 6° per frame.",
+    )
+    parser.add_argument(
+        "--orbit_trip_look_distance",
+        type=float,
+        default=2.0,
+        help="World units ahead of the anchor camera to place the orbit center. "
+        "Adjust for scene scale; ~2.0 is right for N3V coffee_martini.",
+    )
     # Structural args (gaussian_dim, time_duration, num_pts, num_pts_ratio,
     # rot_4d, force_sh_3d) intentionally NOT registered: they describe the
     # tensor layout of the saved model and must come from the training-time
@@ -259,6 +385,9 @@ if __name__ == "__main__":
         args.num_pts_ratio,
         args.rot_4d,
         args.force_sh_3d,
+        add_orbit_trip=args.add_orbit_trip,
+        orbit_trip_frames=args.orbit_trip_frames,
+        orbit_trip_look_distance=args.orbit_trip_look_distance,
     )
 
     print("\nEvaluation complete.")
